@@ -3,6 +3,7 @@ import UIKit
 
 final class KeyboardViewController: UIInputViewController {
     private let controller = KeyboardController()
+    private let inKeyboardDictation = InKeyboardDictationSession()
     private var hostingController: UIHostingController<KeyboardRootView>?
     private let launchSnapshotView = UIImageView()
     private var keyboardHeightConstraint: NSLayoutConstraint?
@@ -52,6 +53,11 @@ final class KeyboardViewController: UIInputViewController {
         controller.keyboardDismisser = { [weak self] in
             self?.dismissKeyboard()
         }
+        controller.currentFullAccess = { [weak self] in self?.hasFullAccess ?? false }
+        controller.inKeyboardDictation = inKeyboardDictation
+        inKeyboardDictation.onReady = { [weak self] in
+            self?.controller.refreshInKeyboardAvailability()
+        }
         controller.prepareInitialPresentationState()
 
         let hostingController = UIHostingController(
@@ -87,6 +93,14 @@ final class KeyboardViewController: UIInputViewController {
             launchSnapshotView.heightAnchor.constraint(equalToConstant: KeyboardRootView.preferredHeight)
         ])
         refreshLaunchSnapshot()
+
+        // Hidden 1pt web view that performs microphone capture; it must live
+        // in the keyboard's window for WebKit to run it.
+        inKeyboardDictation.attach(to: view)
+    }
+
+    deinit {
+        MainActor.assumeIsolated { inKeyboardDictation.tearDown() }
     }
 
     override func viewWillAppear(_ animated: Bool) {

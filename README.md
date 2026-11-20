@@ -38,6 +38,7 @@ This repository is suitable for source review, local development, CI, and TestFl
 
 - **On-device transcription** - FluidAudio Parakeet models run locally through CoreML/ANE; audio does not need to leave the iPhone for transcription.
 - **Keyboard handoff** - The keyboard extension creates a dictation request in the shared App Group, opens the main app to record/transcribe, then polls for the result and inserts it into the active text field.
+- **In-keyboard dictation (opt-in)** - Record and transcribe with Apple's on-device speech recognition directly in the keyboard, without opening Muesli. Falls back to the handoff when unavailable. Capture technique adapted from [ios-keyboard-dictation](https://github.com/stephancill/ios-keyboard-dictation) (MIT).
 - **Keyboard Session Mode** - Keep the containing app ready for lower-friction keyboard dictation while the extension remains the text input surface.
 - **Dictation history** - Saved local dictations can be copied, reused, and deleted from the main app.
 - **Meeting recorder** - Record in-person conversations, save sessions, transcribe locally, browse transcript history, and retain meeting audio only when enabled.
