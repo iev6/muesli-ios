@@ -19,6 +19,10 @@ struct MuesliApp: App {
     init() {
         _coordinator = State(initialValue: DictationCoordinator())
         AppTelemetry.configure()
+        InKeyboardDictationPreferences.mirrorPostProcessing(
+            fillerWordRemoval: MuesliPreferences.fillerWordRemovalEnabled,
+            customDictionary: MuesliPreferences.customDictionaryEnabled
+        )
     }
 
     var body: some Scene {

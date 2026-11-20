@@ -49,6 +49,13 @@ final class KeyboardController {
     var setupVerificationChallenge: KeyboardSetupVerificationChallenge?
     private var lastInsertedCharacterCount = 0
     private var canUseRuntimeStart = false
+    /// Records and transcribes inside the keyboard (opt-in). Nil in tests that
+    /// exercise only the Muesli handoff.
+    var inKeyboardDictation: (any InKeyboardDictating)?
+    private(set) var isInKeyboardCaptureActive = false
+    private(set) var canUseInKeyboardDictation = false
+    private var inKeyboardRequestID: UUID?
+    private var inKeyboardPartialTranscript = ""
 
     init(
         store: SharedStore? = nil,
@@ -71,7 +78,7 @@ final class KeyboardController {
     }
 
     var showsLiveTranscript: Bool {
-        activeRequestID != nil
+        (activeRequestID != nil || isInKeyboardCaptureActive)
             && !liveTranscript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && [.recording, .transcribing].contains(dictationPhase)
     }
@@ -207,6 +214,8 @@ final class KeyboardController {
 
     var opensMuesliFromPrimaryButton: Bool {
         !isBlockedByAppVoiceNote
+            && !isInKeyboardCaptureActive
+            && !(canUseInKeyboardDictation && recoveryRequestID == nil)
             && (recoveryRequestID != nil
                 || !canUseRuntimeStart
                 && (
@@ -237,7 +246,7 @@ final class KeyboardController {
         case .transcribing:
             break
         case .finished:
-            if canUseRuntimeStart {
+            if canUseRuntimeStart || canUseInKeyboardDictation {
                 startDictation()
             } else {
                 prepareLaunchRequestIfNeeded()
@@ -296,6 +305,7 @@ final class KeyboardController {
     func startDictation() {
         refreshLatestDictation()
         guard !isBlockedByAppVoiceNote else { return }
+        if startInKeyboardDictationIfAvailable() { return }
 
         MuesliHaptics.dictationStart()
         KeyboardDiagnosticsLog.record("intent.start", [
@@ -352,6 +362,10 @@ final class KeyboardController {
     }
 
     private func stopActiveDictation() {
+        if isInKeyboardCaptureActive {
+            finishInKeyboardDictation()
+            return
+        }
         guard let activeRequestID else {
             dictationPhase = .idle
             statusText = hasLatestDictation ? "Latest ready" : "Ready"
@@ -417,6 +431,10 @@ final class KeyboardController {
     }
 
     func cancelActiveDictation() {
+        if isInKeyboardCaptureActive {
+            cancelInKeyboardDictation()
+            return
+        }
         refreshLatestDictation()
         guard canCancelActiveDictation else {
             statusText = dictationPhase == .transcribing ? "Transcribing" : statusText
@@ -525,6 +543,7 @@ final class KeyboardController {
     }
 
     func stopObservingSharedState() {
+        abandonInKeyboardDictationForDisappearance()
         // The waveform renders live microphone input. Off screen there is none,
         // so holding the last level is wrong -- and the controller outlives a
         // dismissal, so that stale level gets baked into the launch snapshot
@@ -580,6 +599,13 @@ final class KeyboardController {
     }
 
     private func refreshLatestDictation() {
+        refreshInKeyboardAvailability()
+        // The app's shared status describes handoff requests only; applying it
+        // mid-capture could adopt an older request and overwrite local phase.
+        guard !isInKeyboardCaptureActive else {
+            refreshModelCatalog()
+            return
+        }
         do {
             refreshModelCatalog()
             let runtimeStatus = try store.keyboardRuntimeStatus()
@@ -1243,6 +1269,158 @@ final class KeyboardController {
     private func insertText(_ text: String) {
         textInserter?(text)
         lastInsertedCharacterCount = text.count
+    }
+}
+
+// MARK: - In-keyboard dictation
+
+extension KeyboardController {
+    /// Re-evaluates whether Record should capture in the keyboard. Called on
+    /// refresh and when the capture web view becomes ready.
+    func refreshInKeyboardAvailability() {
+        let availability = inKeyboardAvailability()
+        canUseInKeyboardDictation = availability == .available
+    }
+
+    /// Releases the microphone when the keyboard goes away. Speech heard so far
+    /// is kept in history rather than inserted into a field that is gone.
+    func abandonInKeyboardDictationForDisappearance() {
+        guard isInKeyboardCaptureActive else { return }
+        let partial = inKeyboardPartialTranscript
+        inKeyboardDictation?.cancel()
+        if let requestID = inKeyboardRequestID {
+            saveInKeyboardResult(text: partial, requestID: requestID)
+        }
+        resetInKeyboardState(status: hasLatestDictation ? "Latest ready" : "Ready")
+        KeyboardDiagnosticsLog.record("inline.abandoned", ["characters": String(partial.count)])
+    }
+
+    private func inKeyboardAvailability() -> InKeyboardDictationAvailability {
+        guard let inKeyboardDictation else { return .disabled }
+        return inKeyboardDictation.availability(hasFullAccess: currentFullAccess?() ?? false)
+    }
+
+    /// When Muesli's own mic session is already running, the runtime handoff
+    /// starts without leaving the host app and uses Muesli's local models, so
+    /// it wins. In-keyboard capture covers the case that would otherwise open
+    /// Muesli. Any unavailability falls back to the handoff.
+    fileprivate func startInKeyboardDictationIfAvailable() -> Bool {
+        guard !isInKeyboardCaptureActive,
+              recoveryRequestID == nil,
+              activeRequestID == nil,
+              !canUseRuntimeStart else { return false }
+        let availability = inKeyboardAvailability()
+        canUseInKeyboardDictation = availability == .available
+        guard availability == .available, let inKeyboardDictation else {
+            if availability != .disabled {
+                KeyboardDiagnosticsLog.record("inline.fallback", ["reason": availability.fallbackReason])
+            }
+            return false
+        }
+
+        let requestID = UUID()
+        let handlers = InKeyboardDictationHandlers(
+            onListening: { [weak self] in
+                guard let self, self.inKeyboardRequestID == requestID else { return }
+                self.statusText = "Listening on device"
+            },
+            onPartial: { [weak self] text in
+                guard let self, self.inKeyboardRequestID == requestID else { return }
+                self.inKeyboardPartialTranscript = text
+                self.liveTranscript = text
+            },
+            onLevel: { [weak self] level in
+                guard let self, self.inKeyboardRequestID == requestID else { return }
+                self.inputLevel = level
+            },
+            onCompleted: { [weak self] text in
+                self?.completeInKeyboardDictation(requestID: requestID, rawText: text)
+            },
+            onFailed: { [weak self] message in
+                self?.failInKeyboardDictation(requestID: requestID, message: message)
+            }
+        )
+        guard inKeyboardDictation.start(handlers: handlers) else {
+            KeyboardDiagnosticsLog.record("inline.fallback", ["reason": "startRejected"])
+            return false
+        }
+
+        MuesliHaptics.dictationStart()
+        KeyboardDiagnosticsLog.record("inline.start")
+        inKeyboardRequestID = requestID
+        inKeyboardPartialTranscript = ""
+        isInKeyboardCaptureActive = true
+        liveTranscript = ""
+        inputLevel = 0
+        dictationPhase = .recording
+        statusText = "Starting mic"
+        return true
+    }
+
+    fileprivate func finishInKeyboardDictation() {
+        guard isInKeyboardCaptureActive, dictationPhase == .recording else { return }
+        MuesliHaptics.dictationStop()
+        dictationPhase = .transcribing
+        inputLevel = 0
+        statusText = "Transcribing"
+        inKeyboardDictation?.finish()
+    }
+
+    fileprivate func cancelInKeyboardDictation() {
+        guard isInKeyboardCaptureActive else { return }
+        MuesliHaptics.dictationStop()
+        inKeyboardDictation?.cancel()
+        KeyboardDiagnosticsLog.record("inline.cancelled")
+        resetInKeyboardState(status: "Cancelled")
+    }
+
+    private func completeInKeyboardDictation(requestID: UUID, rawText: String) {
+        guard inKeyboardRequestID == requestID else { return }
+        let customWords = (try? store.customWords()) ?? []
+        let text = InKeyboardDictationPreferences.postProcess(rawText, customWords: customWords)
+        KeyboardDiagnosticsLog.record("inline.completed", ["characters": String(text.count)])
+        guard !text.isEmpty else {
+            resetInKeyboardState(status: "No speech heard")
+            return
+        }
+        insertText(text)
+        saveInKeyboardResult(text: text, requestID: requestID)
+        resetInKeyboardState(status: "Inserted")
+    }
+
+    private func failInKeyboardDictation(requestID: UUID, message: String) {
+        guard inKeyboardRequestID == requestID else { return }
+        KeyboardDiagnosticsLog.record("inline.failed", ["reason": String(message.prefix(48))])
+        resetInKeyboardState(status: "Dictation failed")
+        dictationPhase = .failed
+    }
+
+    private func saveInKeyboardResult(text: String, requestID: UUID) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let result = DictationResult(
+            requestID: requestID,
+            text: trimmed,
+            engineIdentifier: InKeyboardDictationSession.engineIdentifier,
+            source: "keyboard_inline"
+        )
+        // Never auto-delivered later: this keyboard already inserted it.
+        insertedRequestIDs.insert(requestID)
+        guard (try? store.saveKeyboardInlineResult(result)) != nil else { return }
+        latestResultID = result.id
+        hasLatestDictation = true
+    }
+
+    private func resetInKeyboardState(status: String) {
+        isInKeyboardCaptureActive = false
+        inKeyboardRequestID = nil
+        inKeyboardPartialTranscript = ""
+        liveTranscript = ""
+        inputLevel = 0
+        dictationPhase = .idle
+        statusText = status
+        refreshInKeyboardAvailability()
+        prepareLaunchRequestIfNeeded()
     }
 }
 

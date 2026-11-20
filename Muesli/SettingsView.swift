@@ -1,4 +1,6 @@
+import AVFoundation
 import CloudKit
+import Speech
 import SwiftUI
 
 struct SettingsView: View {
@@ -35,6 +37,11 @@ struct SettingsView: View {
     @State private var modelBeingRemoved: LocalTranscriptionModel?
     @State private var modelRemovalErrorMessage: String?
     @State private var isActionButtonOnboardingPresented = false
+    @AppStorage(
+        InKeyboardDictationPreferences.enabledKey,
+        store: InKeyboardDictationPreferences.sharedDefaults
+    ) private var inKeyboardDictationEnabled = false
+    @State private var inKeyboardDictationStatusText: String?
 
 
     var body: some View {
@@ -273,6 +280,19 @@ struct SettingsView: View {
             MuesliSurface {
                 VStack(alignment: .leading, spacing: MuesliTheme.spacing12) {
                     SettingsToggleRow(
+                        icon: "waveform",
+                        title: "Dictate inside the keyboard",
+                        detail: inKeyboardDictationDetail,
+                        isOn: inKeyboardDictationBinding
+                    )
+                    if let inKeyboardDictationStatusText {
+                        Text(inKeyboardDictationStatusText)
+                            .font(MuesliTheme.caption())
+                            .foregroundStyle(MuesliTheme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Divider().overlay(MuesliTheme.surfaceBorder)
+                    SettingsToggleRow(
                         icon: "keyboard.badge.ellipsis",
                         title: "Turn mic off after each dictation",
                         detail: keyboardSessionModeDetail,
@@ -315,6 +335,52 @@ struct SettingsView: View {
         Binding(get: { !keyboardSessionMode }, set: { stopAfterEach in
             coordinator.setKeyboardSessionModeEnabled(!stopAfterEach)
         })
+    }
+
+    private var inKeyboardDictationDetail: String {
+        "Record and transcribe with Apple's on-device speech recognition without opening Muesli. Used when Muesli's mic isn't already on; otherwise, or if it can't start, the keyboard opens Muesli as usual. Requires Full Access."
+    }
+
+    private var inKeyboardDictationBinding: Binding<Bool> {
+        Binding(get: { inKeyboardDictationEnabled }, set: { enabled in
+            guard enabled else {
+                inKeyboardDictationEnabled = false
+                inKeyboardDictationStatusText = nil
+                return
+            }
+            mirrorDictionaryPreferencesForKeyboard()
+            Task { await enableInKeyboardDictation() }
+        })
+    }
+
+    /// Both permissions belong to the app bundle; the keyboard cannot prompt.
+    @MainActor
+    private func enableInKeyboardDictation() async {
+        let microphoneGranted = await AVAudioApplication.requestRecordPermission()
+        let speechStatus = await requestSpeechRecognitionAuthorization()
+        guard microphoneGranted else {
+            inKeyboardDictationEnabled = false
+            inKeyboardDictationStatusText = "Allow microphone access for Muesli in iOS Settings to use this."
+            return
+        }
+        guard speechStatus == .authorized else {
+            inKeyboardDictationEnabled = false
+            inKeyboardDictationStatusText = "Allow Speech Recognition for Muesli in iOS Settings to use this."
+            return
+        }
+        let recognizer = SFSpeechRecognizer()
+        inKeyboardDictationEnabled = true
+        inKeyboardDictationStatusText = recognizer?.supportsOnDeviceRecognition == true
+            ? nil
+            : "On-device recognition isn't available for this iPhone's language yet, so the keyboard will keep opening Muesli."
+        AppTelemetry.signal("keyboard_inline_dictation_enabled")
+    }
+
+    private func mirrorDictionaryPreferencesForKeyboard() {
+        InKeyboardDictationPreferences.mirrorPostProcessing(
+            fillerWordRemoval: MuesliPreferences.fillerWordRemovalEnabled,
+            customDictionary: MuesliPreferences.customDictionaryEnabled
+        )
     }
 
     private var keyboardSessionModeDetail: String {
@@ -1111,6 +1177,14 @@ private struct SettingsRow: View {
                 .font(MuesliTheme.callout())
                 .foregroundStyle(valueColor)
         }
+    }
+}
+
+/// Nonisolated so the authorization callback, which Speech invokes on a
+/// background queue, is not inferred as main-actor isolated.
+private func requestSpeechRecognitionAuthorization() async -> SFSpeechRecognizerAuthorizationStatus {
+    await withCheckedContinuation { continuation in
+        SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
     }
 }
 
